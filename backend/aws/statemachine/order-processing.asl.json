@@ -1,0 +1,64 @@
+{
+  "Comment": "Order processing workflow: validate & reserve inventory, charge mock payment, persist order, publish confirmation event. Compensates by releasing reserved inventory if a later step fails.",
+  "StartAt": "ValidateInventory",
+  "States": {
+    "ValidateInventory": {
+      "Type": "Task",
+      "Resource": "${ValidateInventoryFunctionArn}",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "InventoryUnavailable" }],
+      "Next": "ReserveInventory"
+    },
+    "ReserveInventory": {
+      "Type": "Task",
+      "Resource": "${ReserveInventoryFunctionArn}",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "InventoryUnavailable" }],
+      "Next": "ProcessPayment"
+    },
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "${ProcessPaymentFunctionArn}",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CompensateAfterPaymentFailure" }],
+      "Next": "CreateOrder"
+    },
+    "CompensateAfterPaymentFailure": {
+      "Type": "Task",
+      "Resource": "${ReserveInventoryFunctionArn}",
+      "Parameters": { "orderId.$": "$.orderId", "items.$": "$.items", "action": "release" },
+      "ResultPath": null,
+      "Next": "PaymentFailed"
+    },
+    "CreateOrder": {
+      "Type": "Task",
+      "Resource": "${CreateOrderFunctionArn}",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CompensateAfterOrderFailure" }],
+      "Next": "PublishOrderEvent"
+    },
+    "CompensateAfterOrderFailure": {
+      "Type": "Task",
+      "Resource": "${ReserveInventoryFunctionArn}",
+      "Parameters": { "orderId.$": "$.orderId", "items.$": "$.items", "action": "release" },
+      "ResultPath": null,
+      "Next": "OrderPersistFailed"
+    },
+    "PublishOrderEvent": {
+      "Type": "Task",
+      "Resource": "${PublishOrderEventFunctionArn}",
+      "End": true
+    },
+    "InventoryUnavailable": {
+      "Type": "Fail",
+      "Error": "InventoryUnavailable",
+      "Cause": "Requested quantity exceeds available stock, or reservation failed."
+    },
+    "PaymentFailed": {
+      "Type": "Fail",
+      "Error": "PaymentFailed",
+      "Cause": "Mock payment was declined; reserved inventory was released."
+    },
+    "OrderPersistFailed": {
+      "Type": "Fail",
+      "Error": "OrderPersistFailed",
+      "Cause": "Could not persist the order record; reserved inventory was released."
+    }
+  }
+}
