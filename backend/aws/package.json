@@ -1,0 +1,15 @@
+{
+  "name": "shop-pipeline-aws",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.650.0",
+    "@aws-sdk/client-ses": "^3.650.0",
+    "@aws-sdk/client-sfn": "^3.650.0",
+    "@aws-sdk/client-sns": "^3.650.0",
+    "@aws-sdk/client-sqs": "^3.650.0",
+    "@aws-sdk/lib-dynamodb": "^3.650.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

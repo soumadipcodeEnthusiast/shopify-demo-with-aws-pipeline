@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  End-to-end order-processing pipeline demo: API Gateway + Lambda checkout,
+  SQS job queue with DLQ, Step Functions (Express) orchestrating inventory
+  validation/reservation, mock payment and order creation, SNS publish, and
+  an SES-backed email notification. See AWS_SETUP.md for the manual steps
+  only you can do with your own AWS account.
+
+Parameters:
+  NotificationSenderEmail:
+    Type: String
+    Default: ""
+    Description: >
+      A sender email address you have verified in Amazon SES (see
+      AWS_SETUP.md). Leave blank to run with email sending disabled — the
+      pipeline will mark EMAIL_SENT as SKIPPED instead of faking success.
+  CognitoCallbackUrl:
+    Type: String
+    Default: "http://localhost:5173/auth/callback"
+    Description: Where Cognito Hosted UI redirects after login. Set this to your deployed frontend URL in production.
+  CognitoDomainPrefix:
+    Type: String
+    Description: >
+      Globally-unique Cognito Hosted UI domain prefix, e.g. my-shop-pipeline-demo.
+      Must be unique across all of AWS, not just your account — change it if
+      `sam deploy` reports it's taken.
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 10
+    MemorySize: 256
+    Environment:
+      Variables:
+        ORDER_EVENTS_TABLE: !Ref OrderEventsTable
+
+Resources:
+  # ---------- Data ----------
+  ProductsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey: { Name: id, Type: String }
+      # Provisioned 5/5 instead of on-demand: this is the capacity the AWS
+      # classic Free Tier explicitly guarantees forever, not a newer policy
+      # that could change. Demo traffic never gets close to 5 RPS.
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+
+  OrdersTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey: { Name: orderId, Type: String }
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+
+  OrderEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      AttributeDefinitions:
+        - { AttributeName: orderId, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: orderId, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+
+  # ---------- Messaging ----------
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+
+  OrderProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Must be >= OrderJobProcessorFunction's 30s timeout. Kept at the
+      # minimum so a failing order reaches the DLQ in ~1.5 min during a demo.
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  # ---------- Auth ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      # Lite: 10k MAU free and the classic Hosted UI, no paid features.
+      UserPoolTier: LITE
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows: [implicit]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs: [!Ref CognitoCallbackUrl]
+      SupportedIdentityProviders: [COGNITO]
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  # SES sandbox: request a verification link for each new user at sign-up so
+  # their order confirmation emails can be delivered to them.
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/postConfirmation/
+      Handler: index.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ses:VerifyEmailIdentity]
+              Resource: "*"
+      Events:
+        SignUpConfirmed:
+          Type: Cognito
+          Properties: { UserPool: !Ref UserPool, Trigger: PostConfirmation }
+
+  # ---------- API ----------
+  OrderApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  GetProductsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/getProducts/
+      Handler: index.handler
+      Environment:
+        Variables: { PRODUCTS_TABLE: !Ref ProductsTable }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ProductsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties: { RestApiId: !Ref OrderApi, Path: /products, Method: get }
+
+  CheckoutFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/checkoutHandler/
+      Handler: index.handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_QUEUE_URL: !Ref OrderProcessingQueue
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt OrderProcessingQueue.QueueName }
+      Events:
+        Post:
+          Type: Api
+          Properties: { RestApiId: !Ref OrderApi, Path: /checkout, Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  GetOrderStatusFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/getOrderStatus/
+      Handler: index.handler
+      Environment:
+        Variables: { ORDERS_TABLE: !Ref OrdersTable }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref OrdersTable }
+        - DynamoDBReadPolicy: { TableName: !Ref OrderEventsTable }
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderApi
+            Path: /orders/{orderId}
+            Method: get
+            Auth: { Authorizer: CognitoAuthorizer }
+
+  # ---------- Async job handoff ----------
+  OrderJobProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/orderJobProcessor/
+      Handler: index.handler
+      Timeout: 30
+      Environment:
+        Variables: { STATE_MACHINE_ARN: !Ref OrderProcessingStateMachine, MAX_RECEIVE_COUNT: "3" }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+        # StepFunctionsExecutionPolicy only grants states:StartExecution; this
+        # consumer needs states:StartSyncExecution for the EXPRESS workflow.
+        - Statement:
+            - Effect: Allow
+              Action: [states:StartSyncExecution, states:StartExecution]
+              Resource: !Ref OrderProcessingStateMachine
+      Events:
+        Queue:
+          Type: SQS
+          Properties: { Queue: !GetAtt OrderProcessingQueue.Arn, BatchSize: 1 }
+
+  OrderDlqHandlerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/orderDlqHandler/
+      Handler: index.handler
+      Environment:
+        Variables: { ORDERS_TABLE: !Ref OrdersTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+      Events:
+        Queue:
+          Type: SQS
+          Properties: { Queue: !GetAtt OrderProcessingDLQ.Arn, BatchSize: 1 }
+
+  # ---------- Step Functions workflow steps ----------
+  ValidateInventoryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/validateInventory/
+      Handler: index.handler
+      Environment:
+        Variables: { PRODUCTS_TABLE: !Ref ProductsTable }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ProductsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+
+  ReserveInventoryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/reserveInventory/
+      Handler: index.handler
+      Environment:
+        Variables: { PRODUCTS_TABLE: !Ref ProductsTable }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ProductsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+
+  ProcessPaymentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/processPayment/
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/createOrder/
+      Handler: index.handler
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ProductsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+
+  PublishOrderEventFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/publishOrderEvent/
+      Handler: index.handler
+      Environment:
+        Variables: { ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic }
+      Policies:
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt OrderEventsTopic.TopicName }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+
+  NotificationHandlerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: "es2020", EntryPoints: ["index.js"] }
+    Properties:
+      CodeUri: src/notificationHandler/
+      Handler: index.handler
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL: !Ref NotificationSenderEmail
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderEventsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail, ses:GetIdentityVerificationAttributes, ses:VerifyEmailIdentity]
+              Resource: "*"
+      Events:
+        Notify:
+          Type: SNS
+          Properties: { Topic: !Ref OrderEventsTopic }
+
+  # ---------- Orchestration ----------
+  OrderStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  OrderProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: EXPRESS
+      DefinitionUri: statemachine/order-processing.asl.json
+      DefinitionSubstitutions:
+        ValidateInventoryFunctionArn: !GetAtt ValidateInventoryFunction.Arn
+        ReserveInventoryFunctionArn: !GetAtt ReserveInventoryFunction.Arn
+        ProcessPaymentFunctionArn: !GetAtt ProcessPaymentFunction.Arn
+        CreateOrderFunctionArn: !GetAtt CreateOrderFunction.Arn
+        PublishOrderEventFunctionArn: !GetAtt PublishOrderEventFunction.Arn
+      Logging:
+        # ERROR only: the per-step timeline already lives in OrderEventsTable,
+        # so full execution logging would just add CloudWatch ingestion cost.
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt OrderStateMachineLogGroup.Arn }
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref ValidateInventoryFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref ReserveInventoryFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref ProcessPaymentFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref CreateOrderFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref PublishOrderEventFunction }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+
+Outputs:
+  ApiUrl:
+    Description: Put this in frontend/.env as VITE_API_BASE (no trailing slash)
+    Value: !Sub "https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Description: Put this (without https://) in frontend/.env as VITE_COGNITO_DOMAIN
+    Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  StateMachineArn:
+    Value: !Ref OrderProcessingStateMachine
+  ProductsTableName:
+    Value: !Ref ProductsTable
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  OrderEventsTableName:
+    Value: !Ref OrderEventsTable
+  OrderProcessingQueueUrl:
+    Value: !Ref OrderProcessingQueue
+  OrderProcessingDLQUrl:
+    Value: !Ref OrderProcessingDLQ
+  OrderEventsTopicArn:
+    Value: !Ref OrderEventsTopic
